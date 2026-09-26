@@ -13,6 +13,7 @@ const { metricsHandler } = require('./metrics');
 const { createRateLimiter } = require('./rateLimiter');
 const { traceContextMiddleware } = require('../../scripts/traceContext');
 const { openApiSpec } = require('./openapi');
+const { createKafkaPipeline } = require('./kafkaPipeline');
 
 const DEFAULT_PORT = 4000;
 
@@ -115,6 +116,16 @@ function registerRestRoutes(app, deps = dbHelpers) {
     }
   });
 
+  // Issue #1280: expose Kafka ingestion pipeline health so operators can
+  // observe consumer lag and deduplication cache size under ledger surges.
+  app.get('/api/kafka/health', (req, res) => {
+    const pipeline = app.locals.kafkaPipeline;
+    if (!pipeline) {
+      return res.status(503).json({ status: 'unavailable' });
+    }
+    res.json({ status: 'ok', ...pipeline.stats() });
+  });
+
   return app;
 }
 
@@ -190,6 +201,19 @@ function startApiServer(port = DEFAULT_PORT) {
         },
         { server: httpServer, path: '/graphql' },
       );
+
+      // Issue #1280: start the distributed Kafka ingestion pipeline. The
+      // producer publishes raw ledger blocks and the consumer group processes
+      // them exactly-once with a deduplication cache and offset checkpointing.
+      try {
+        const pipeline = createKafkaPipeline({ db: dbHelpers });
+        app.locals.kafkaPipeline = pipeline;
+        pipeline.start().catch((err) => {
+          console.error('Failed to start Kafka ingestion pipeline:', err);
+        });
+      } catch (err) {
+        console.error('Failed to initialize Kafka ingestion pipeline:', err);
+      }
 
       console.log(`GraphQL API ready at http://localhost:${port}/graphql`);
       console.log(`GraphQL subscriptions ready at ws://localhost:${port}/graphql`);
